@@ -1,310 +1,446 @@
-// WinSwitch — Cmd+Tab for apps, Cmd+` for windows within an app
-// No SCStream, no screen capture. AXUIElement + NSWorkspace only.
+// WinSwitch — Spotlight-style window switcher
+// Cmd+` to open, type to filter, arrows to navigate, click or Enter to switch
 import AppKit
 
-let kTab:   CGKeyCode = 48
-let kGrave: CGKeyCode = 50
+let kGrave:     CGKeyCode = 50
+let kReturn:    CGKeyCode = 36
+let kEscape:    CGKeyCode = 53
+let kUp:        CGKeyCode = 126
+let kDown:      CGKeyCode = 125
+let kDelete:    CGKeyCode = 51   // backspace
 
 // MARK: - Models
 
-struct AppInfo {
-    let app: NSRunningApplication
-    var title: String { app.localizedName ?? "?" }
-    var icon:  NSImage? { app.icon }
-}
-
 struct WinInfo {
-    let ax: AXUIElement
+    let ax:    AXUIElement
     let title: String
+    let app:   NSRunningApplication
 }
 
-// MARK: - Helpers
-
-func runningApps() -> [AppInfo] {
-    NSWorkspace.shared.runningApplications
-        .filter { $0.activationPolicy == .regular && !$0.isHidden || $0.activationPolicy == .regular }
-        .filter { $0.activationPolicy == .regular }
-        .map { AppInfo(app: $0) }
-}
-
-func windowsFor(pid: pid_t) -> [WinInfo] {
+func windowsForFrontApp() -> (app: NSRunningApplication, wins: [WinInfo])? {
+    guard let front = NSWorkspace.shared.frontmostApplication else { return nil }
+    let pid   = front.processIdentifier
     let axApp = AXUIElementCreateApplication(pid)
-    var val: AnyObject?
+    var val:  AnyObject?
     guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &val) == .success,
-          let wins = val as? [AXUIElement] else { return [] }
-    return wins.compactMap { ax -> WinInfo? in
-        var minVal: AnyObject?
-        AXUIElementCopyAttributeValue(ax, kAXMinimizedAttribute as CFString, &minVal)
-        if minVal as? Bool == true { return nil }
+          let axWins = val as? [AXUIElement] else { return nil }
+    let wins: [WinInfo] = axWins.compactMap { ax in
+        var m: AnyObject?
+        AXUIElementCopyAttributeValue(ax, kAXMinimizedAttribute as CFString, &m)
+        if m as? Bool == true { return nil }
         var t: AnyObject?
         AXUIElementCopyAttributeValue(ax, kAXTitleAttribute as CFString, &t)
-        return WinInfo(ax: ax, title: t as? String ?? "")
+        return WinInfo(ax: ax, title: t as? String ?? "", app: front)
     }
+    return wins.isEmpty ? nil : (front, wins)
 }
 
-func focusedWinIndex(in wins: [WinInfo], pid: pid_t) -> Int {
-    let axApp = AXUIElementCreateApplication(pid)
+func focusedIndex(in wins: [WinInfo]) -> Int {
+    guard let front = wins.first?.app else { return 0 }
+    let axApp = AXUIElementCreateApplication(front.processIdentifier)
     var val: AnyObject?
     guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &val) == .success else { return 0 }
     let focused = val as! AXUIElement
     return wins.firstIndex { CFEqual($0.ax, focused) } ?? 0
 }
 
-// MARK: - Row view (used for both apps and windows)
+// MARK: - Row
 
-class RowView: NSView {
-    var onTap: (() -> Void)?
+class RowButton: NSButton {
+    override var wantsUpdateLayer: Bool { true }
 
-    init(icon: NSImage?, title: String, selected: Bool) {
+    init(title: String, tag: Int, selected: Bool) {
         super.init(frame: .zero)
-        wantsLayer = true
-        if selected {
-            layer?.backgroundColor = NSColor.controlAccentColor.cgColor
-            layer?.cornerRadius    = 8
-        }
-
-        var leading: CGFloat = 10
-        if let icon {
-            let iv = NSImageView(image: icon)
-            iv.imageScaling = .scaleProportionallyDown
-            iv.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(iv)
-            NSLayoutConstraint.activate([
-                iv.leadingAnchor .constraint(equalTo: leadingAnchor, constant: 10),
-                iv.centerYAnchor .constraint(equalTo: centerYAnchor),
-                iv.widthAnchor   .constraint(equalToConstant: 22),
-                iv.heightAnchor  .constraint(equalToConstant: 22),
-            ])
-            leading = 38
-        }
-
-        let lbl = NSTextField(labelWithString: title.isEmpty ? "(untitled)" : title)
-        lbl.font          = .systemFont(ofSize: 13, weight: selected ? .medium : .regular)
-        lbl.textColor     = selected ? .white : .labelColor
-        lbl.lineBreakMode = .byTruncatingTail
-        lbl.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(lbl)
-        NSLayoutConstraint.activate([
-            lbl.leadingAnchor .constraint(equalTo: leadingAnchor,  constant: leading),
-            lbl.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            lbl.centerYAnchor .constraint(equalTo: centerYAnchor),
-            heightAnchor.constraint(equalToConstant: 32),
-            widthAnchor .constraint(greaterThanOrEqualToConstant: 280),
-        ])
+        self.tag          = tag
+        isBordered        = false
+        bezelStyle        = .rounded
+        alignment         = .left
+        lineBreakMode     = .byTruncatingMiddle
+        font              = .systemFont(ofSize: 13, weight: selected ? .medium : .regular)
+        contentTintColor  = selected ? .white : .labelColor
+        wantsLayer        = true
+        layer?.cornerRadius = 7
+        layer?.backgroundColor = selected
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.clear.cgColor
+        attributedTitle = NSAttributedString(
+            string: title.isEmpty ? "(untitled)" : title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: selected ? .medium : .regular),
+                .foregroundColor: selected ? NSColor.white : NSColor.labelColor,
+            ]
+        )
+        heightAnchor.constraint(equalToConstant: 32).isActive = true
+        widthAnchor .constraint(greaterThanOrEqualToConstant: 320).isActive = true
     }
     required init?(coder: NSCoder) { fatalError() }
-    override func mouseDown(with _: NSEvent) { onTap?() }
 }
 
-// MARK: - Overlay panel
+// MARK: - Overlay
 
 class Overlay: NSPanel {
-    private let stack = NSStackView()
-    var onPick: ((Int) -> Void)?
+    private let blur       = NSVisualEffectView()
+    private let searchIcon = NSTextField(labelWithString: "")
+    private let searchLbl  = NSTextField(labelWithString: "")
+    private let divider    = NSBox()
+    private let stack      = NSStackView()
+    private let scrollView = NSScrollView()
+
+    var onPick: ((Int) -> Void)?   // original index
+
+    private var allWins:   [WinInfo] = []
+    private var filtered:  [(orig: Int, win: WinInfo)] = []
+    private var query      = ""
+    private var selRow     = 0
 
     init() {
         super.init(contentRect: .zero,
-                   styleMask: [.borderless, .nonactivatingPanel],
+                   styleMask:   [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         isOpaque           = false
         backgroundColor    = .clear
         level              = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate  = false
+        hasShadow          = true
 
-        let blur = NSVisualEffectView()
         blur.material     = .hudWindow
         blur.blendingMode = .behindWindow
         blur.state        = .active
         blur.wantsLayer   = true
-        blur.layer?.cornerRadius    = 14
-        blur.layer?.masksToBounds   = true
+        blur.layer?.cornerRadius  = 14
+        blur.layer?.masksToBounds = true
         contentView = blur
 
-        stack.orientation  = .vertical
-        stack.spacing      = 3
-        stack.edgeInsets   = NSEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        // search row
+        searchIcon.stringValue = "⌘`"
+        searchIcon.font        = .systemFont(ofSize: 11, weight: .medium)
+        searchIcon.textColor   = .tertiaryLabelColor
+        searchIcon.isSelectable = false
+
+        searchLbl.font          = .systemFont(ofSize: 14)
+        searchLbl.textColor     = .labelColor
+        searchLbl.isSelectable  = false
+        searchLbl.stringValue   = ""
+        searchLbl.placeholderString = "type to filter…"  // won't show (not editable) but documents intent
+
+        let searchRow = NSStackView(views: [searchIcon, searchLbl])
+        searchRow.orientation = .horizontal
+        searchRow.spacing     = 8
+        searchRow.edgeInsets  = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
+        searchRow.heightAnchor.constraint(equalToConstant: 40).isActive = true
+
+        divider.boxType     = .separator
+        divider.alphaValue  = 0.3
+
+        // scrollable list
+        stack.orientation = .vertical
+        stack.spacing     = 2
+        stack.edgeInsets  = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        blur.addSubview(stack)
+
+        scrollView.documentView              = stack
+        scrollView.hasVerticalScroller       = false
+        scrollView.drawsBackground           = false
+        scrollView.automaticallyAdjustsContentInsets = false
+
+        let outer = NSStackView(views: [searchRow, divider, scrollView])
+        outer.orientation   = .vertical
+        outer.spacing       = 0
+        outer.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(outer)
         NSLayoutConstraint.activate([
-            stack.topAnchor    .constraint(equalTo: blur.topAnchor),
-            stack.bottomAnchor .constraint(equalTo: blur.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            outer.topAnchor    .constraint(equalTo: blur.topAnchor),
+            outer.bottomAnchor .constraint(equalTo: blur.bottomAnchor),
+            outer.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            outer.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 340),
         ])
     }
 
-    func reload<T>(items: [(icon: NSImage?, title: String)], selected idx: Int, tag: T) {
-        stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
-        for (i, item) in items.enumerated() {
-            let row = RowView(icon: item.icon, title: item.title, selected: i == idx)
-            row.onTap = { [weak self] in self?.onPick?(i) }
-            stack.addArrangedSubview(row)
-        }
-        stack.layoutSubtreeIfNeeded()
-        let fit = stack.fittingSize
-        setContentSize(fit)
-        if let screen = NSScreen.main {
-            setFrameOrigin(NSPoint(
-                x: screen.visibleFrame.midX - fit.width  / 2,
-                y: screen.visibleFrame.midY - fit.height / 2
-            ))
-        }
+    // MARK: Public API (called from Switcher)
+
+    func present(wins: [WinInfo], initialIndex: Int) {
+        allWins  = wins
+        query    = ""
+        selRow   = 0
+        applyFilter()
+        // place selection at the "next" window (initialIndex already advanced by caller)
+        selRow = filtered.firstIndex { $0.orig == initialIndex } ?? 0
+        rebuild()
+        refit()
         orderFront(nil)
     }
 
-    func hide() { orderOut(nil) }
+    func appendChar(_ c: Character) {
+        query.append(c)
+        applyFilter()
+        selRow = 0
+        rebuild(); refit()
+    }
+
+    func deleteChar() {
+        guard !query.isEmpty else { return }
+        query.removeLast()
+        applyFilter()
+        selRow = 0
+        rebuild(); refit()
+    }
+
+    func moveSelection(_ delta: Int) {
+        guard !filtered.isEmpty else { return }
+        selRow = (selRow + delta + filtered.count) % filtered.count
+        rebuild()
+        scrollToSel()
+    }
+
+    func currentOrigIndex() -> Int? {
+        filtered.indices.contains(selRow) ? filtered[selRow].orig : nil
+    }
+
+    func hide() { orderOut(nil); allWins = []; query = ""; filtered = [] }
+
+    // MARK: Private
+
+    private func applyFilter() {
+        if query.isEmpty {
+            filtered = allWins.enumerated().map { ($0, $1) }
+        } else {
+            let q = query.lowercased()
+            filtered = allWins.enumerated().compactMap { i, w in
+                w.title.lowercased().contains(q) ? (i, w) : nil
+            }
+        }
+    }
+
+    private func rebuild() {
+        searchLbl.stringValue = query
+
+        stack.arrangedSubviews.forEach { stack.removeArrangedSubview($0); $0.removeFromSuperview() }
+
+        if filtered.isEmpty {
+            let lbl = NSTextField(labelWithString: "No match")
+            lbl.textColor  = .tertiaryLabelColor
+            lbl.font       = .systemFont(ofSize: 13)
+            lbl.alignment  = .center
+            lbl.heightAnchor.constraint(equalToConstant: 32).isActive = true
+            stack.addArrangedSubview(lbl)
+            return
+        }
+
+        for (row, item) in filtered.enumerated() {
+            let btn = RowButton(title: item.win.title, tag: item.orig, selected: row == selRow)
+            btn.target = self
+            btn.action = #selector(rowClicked(_:))
+            stack.addArrangedSubview(btn)
+        }
+    }
+
+    @objc private func rowClicked(_ sender: NSButton) {
+        onPick?(sender.tag)
+    }
+
+    private func scrollToSel() {
+        guard selRow < stack.arrangedSubviews.count else { return }
+        let view = stack.arrangedSubviews[selRow]
+        stack.scrollToVisible(view.frame)
+    }
+
+    private func refit() {
+        stack.layoutSubtreeIfNeeded()
+        let rowH:    CGFloat = 34
+        let maxRows: CGFloat = 8
+        let listH   = min(CGFloat(max(filtered.count, 1)) * rowH + 12, maxRows * rowH + 12)
+        let totalH  = 40 + 1 + listH    // searchRow + divider + list
+        let width   = (stack.arrangedSubviews.first as? NSButton)
+            .map { _ in CGFloat(340) } ?? 340
+        setContentSize(NSSize(width: width + 16, height: totalH))
+        scrollView.heightAnchor.constraint(equalToConstant: listH).isActive = true
+
+        if let screen = NSScreen.main {
+            setFrameOrigin(NSPoint(
+                x: screen.visibleFrame.midX - frame.width  / 2,
+                y: screen.visibleFrame.midY - frame.height / 2 + 80
+            ))
+        }
+    }
 }
 
-// MARK: - Switcher state machine
-
-enum SwitcherMode {
-    case apps([AppInfo])
-    case windows(pid: pid_t, app: NSRunningApplication, wins: [WinInfo])
-}
+// MARK: - Switcher
 
 class Switcher {
-    private var mode:     SwitcherMode?
-    private var selected: Int = 0
-    private let overlay   = Overlay()
+    private var wins:    [WinInfo] = []
+    private var overlay  = Overlay()
+    var isVisible = false
 
     init() { overlay.onPick = { [weak self] i in self?.commit(i) } }
 
-    func triggerApps(reverse: Bool) {
-        let apps: [AppInfo]
-        if case .apps(let a) = mode { apps = a } else {
-            apps = runningApps()
-            guard apps.count > 1 else { return }
-            // start selection at current frontmost
-            let front = NSWorkspace.shared.frontmostApplication
-            selected  = apps.firstIndex { $0.app == front } ?? 0
-            mode      = .apps(apps)
-        }
-        let n = apps.count
-        selected = reverse ? (selected - 1 + n) % n : (selected + 1) % n
-        overlay.reload(
-            items: apps.map { (icon: $0.icon, title: $0.title) },
-            selected: selected, tag: 0
-        )
-    }
+    func trigger(reverse: Bool) {
+        guard let (_, ws) = windowsForFrontApp(), ws.count > 1 else { return }
 
-    func triggerWindows(reverse: Bool) {
-        let wins: [WinInfo]
-        let pid:  pid_t
-        let frontApp: NSRunningApplication
-        if case .windows(let p, let a, let w) = mode {
-            wins = w; pid = p; frontApp = a
+        if !isVisible {
+            wins      = ws
+            let start = focusedIndex(in: wins)
+            let next  = reverse
+                ? (start - 1 + wins.count) % wins.count
+                : (start + 1) % wins.count
+            isVisible = true
+            overlay.present(wins: wins, initialIndex: next)
         } else {
-            guard let app = NSWorkspace.shared.frontmostApplication else { return }
-            frontApp = app
-            pid      = app.processIdentifier
-            wins     = windowsFor(pid: pid)
-            guard wins.count > 1 else { return }
-            selected  = focusedWinIndex(in: wins, pid: pid)
-            mode      = .windows(pid: pid, app: frontApp, wins: wins)
+            overlay.moveSelection(reverse ? -1 : 1)
         }
-        let n = wins.count
-        selected = reverse ? (selected - 1 + n) % n : (selected + 1) % n
-        overlay.reload(
-            items: wins.map { (icon: nil, title: $0.title) },
-            selected: selected, tag: 0
-        )
     }
 
-    func commitIfVisible() {
-        guard mode != nil else { return }
-        commit(selected)
+    func appendChar(_ c: Character) {
+        guard isVisible else { return }
+        overlay.appendChar(c)
+    }
+
+    func deleteChar() {
+        guard isVisible else { return }
+        overlay.deleteChar()
+    }
+
+    func moveSelection(_ delta: Int) {
+        guard isVisible else { return }
+        overlay.moveSelection(delta)
+    }
+
+    func commitCurrent() {
+        guard isVisible, let idx = overlay.currentOrigIndex() else {
+            dismiss(); return
+        }
+        commit(idx)
+    }
+
+    func dismiss() {
+        isVisible = false
+        overlay.hide()
     }
 
     private func commit(_ idx: Int) {
-        defer { mode = nil; overlay.hide() }
-        switch mode {
-        case .apps(let apps):
-            guard idx < apps.count else { return }
-            apps[idx].app.activate(options: [])
-        case .windows(_, let app, let wins):
-            guard idx < wins.count else { return }
-            AXUIElementPerformAction(wins[idx].ax, kAXRaiseAction as CFString)
-            app.activate(options: [])
-        case nil:
-            break
-        }
+        isVisible = false
+        overlay.hide()
+        guard idx < wins.count else { return }
+        let w = wins[idx]
+        AXUIElementPerformAction(w.ax, kAXRaiseAction as CFString)
+        w.app.activate(options: [])
     }
 }
 
-extension SwitcherMode? {
-    var isActive: Bool { if case .none = self { return false }; return true }
-}
-
-// MARK: - Global event tap
+// MARK: - Event tap
 
 class HotkeyMonitor {
     private var tap:      CFMachPort?
     private let switcher = Switcher()
 
     func start() {
-        let opts = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(opts)
+        guard AXIsProcessTrusted() else {
+            let opts = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(opts)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+            return
+        }
+        if !CGPreflightListenEventAccess() {
+            CGRequestListenEventAccess()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+            return
+        }
+        createTap()
+    }
 
+    private func createTap() {
         let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
                               | (1 << CGEventType.flagsChanged.rawValue)
-
         tap = CGEvent.tapCreate(
-            tap:              .cgSessionEventTap,
-            place:            .headInsertEventTap,
-            options:          .defaultTap,
-            eventsOfInterest: mask,
+            tap: .cgSessionEventTap, place: .headInsertEventTap,
+            options: .defaultTap, eventsOfInterest: mask,
             callback: { _, type, event, ref in
                 Unmanaged<HotkeyMonitor>.fromOpaque(ref!).takeUnretainedValue()
                     .handle(type: type, event: event)
             },
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         )
-        guard let tap else { return }
+        guard let tap else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.createTap() }
+            return
+        }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        let flags  = event.flags
-        let cmd    = flags.contains(.maskCommand)
-        let shift  = flags.contains(.maskShift)
-
-        if type == .keyDown && cmd {
-            let key = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
-            switch key {
-            case kTab:
-                DispatchQueue.main.async { self.switcher.triggerApps(reverse: shift) }
-                return nil   // consume — replace system Cmd+Tab
-            case kGrave:
-                DispatchQueue.main.async { self.switcher.triggerWindows(reverse: shift) }
-                return nil
-            default: break
-            }
-        }
+        let flags = event.flags
+        let cmd   = flags.contains(.maskCommand)
+        let shift = flags.contains(.maskShift)
 
         if type == .flagsChanged && !cmd {
-            // Cmd released → activate selection
-            DispatchQueue.main.async { self.switcher.commitIfVisible() }
+            DispatchQueue.main.async { self.switcher.commitCurrent() }
+            return Unmanaged.passRetained(event)
         }
 
+        guard type == .keyDown else { return Unmanaged.passRetained(event) }
+        let key = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
+
+        // Cmd+` — open or cycle
+        if key == kGrave && cmd {
+            DispatchQueue.main.async { self.switcher.trigger(reverse: shift) }
+            return nil
+        }
+
+        // Navigation keys when overlay is open
+        guard switcher.isVisible else { return Unmanaged.passRetained(event) }
+
+        switch key {
+        case kEscape:
+            DispatchQueue.main.async { self.switcher.dismiss() }
+            return nil
+        case kReturn:
+            DispatchQueue.main.async { self.switcher.commitCurrent() }
+            return nil
+        case kUp:
+            DispatchQueue.main.async { self.switcher.moveSelection(-1) }
+            return nil
+        case kDown:
+            DispatchQueue.main.async { self.switcher.moveSelection(1) }
+            return nil
+        case kDelete:
+            DispatchQueue.main.async { self.switcher.deleteChar() }
+            return nil
+        default:
+            // Printable character → search
+            if let cgChar = event.unicodeCharacters, !cmd {
+                DispatchQueue.main.async { self.switcher.appendChar(cgChar) }
+                return nil
+            }
+        }
         return Unmanaged.passRetained(event)
+    }
+}
+
+extension CGEvent {
+    var unicodeCharacters: Character? {
+        var buf = [UniChar](repeating: 0, count: 4)
+        var len: Int = 0
+        keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &len, unicodeString: &buf)
+        guard len > 0,
+              let scalar = Unicode.Scalar(buf[0]),
+              scalar.value >= 32 else { return nil }
+        return Character(scalar)
     }
 }
 
 // MARK: - Entry point
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    let monitor = HotkeyMonitor()
+    let monitor    = HotkeyMonitor()
     var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let btn = statusItem?.button {
-            btn.image = NSImage(systemSymbolName: "square.3.layers.3d.top.filled",
-                                accessibilityDescription: "WinSwitch")
-        }
+        statusItem?.button?.image = NSImage(systemSymbolName: "square.3.layers.3d.top.filled",
+                                            accessibilityDescription: "WinSwitch")
         let menu = NSMenu()
         menu.addItem(withTitle: "Quit WinSwitch", action: #selector(quit), keyEquivalent: "q")
         statusItem?.menu = menu

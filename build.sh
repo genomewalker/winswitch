@@ -27,6 +27,8 @@ cat > "$OUT/Contents/Info.plist" <<EOF
     <key>NSPrincipalClass</key>      <string>NSApplication</string>
     <key>NSAccessibilityUsageDescription</key>
     <string>WinSwitch needs Accessibility access to read window titles and switch focus.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>WinSwitch needs Input Monitoring to intercept Cmd+grave for window switching.</string>
 </dict>
 </plist>
 EOF
