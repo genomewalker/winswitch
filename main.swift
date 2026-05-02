@@ -282,8 +282,8 @@ class Switcher {
             wins      = ws
             let start = focusedIndex(in: wins)
             let next  = reverse
-                ? (start - 1 + wins.count) % wins.count
-                : (start + 1) % wins.count
+                ? (start + 1) % wins.count
+                : (start - 1 + wins.count) % wins.count
             isVisible = true
             overlay.present(wins: wins, initialIndex: next)
         } else {
