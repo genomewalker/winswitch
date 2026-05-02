@@ -335,18 +335,38 @@ class HotkeyMonitor {
     private let switcher = Switcher()
 
     func start() {
-        guard AXIsProcessTrusted() else {
+        // Prompt once, then poll silently
+        if !AXIsProcessTrusted() {
             let opts = [kAXTrustedCheckOptionPrompt.takeRetainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(opts)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+            pollUntilTrusted()
             return
         }
         if !CGPreflightListenEventAccess() {
-            CGRequestListenEventAccess()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.start() }
+            CGRequestListenEventAccess()   // shows dialog once
+            pollUntilListenAccess()
             return
         }
         createTap()
+    }
+
+    private func pollUntilTrusted() {
+        guard !AXIsProcessTrusted() else {
+            // Now trusted — check input monitoring
+            if !CGPreflightListenEventAccess() {
+                CGRequestListenEventAccess()
+                pollUntilListenAccess()
+            } else {
+                createTap()
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.pollUntilTrusted() }
+    }
+
+    private func pollUntilListenAccess() {
+        guard !CGPreflightListenEventAccess() else { createTap(); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.pollUntilListenAccess() }
     }
 
     private func createTap() {
