@@ -12,6 +12,8 @@ echo "Compiling..."
 swiftc main.swift \
     -O \
     -framework AppKit \
+    -F /System/Library/PrivateFrameworks \
+    -framework SkyLight \
     -o "$BINARY"
 
 cat > "$OUT/Contents/Info.plist" <<EOF
